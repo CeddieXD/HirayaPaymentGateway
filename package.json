@@ -1,0 +1,10 @@
+{
+  "name": "hiraya-payment-gateway-sandbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local simulated payment partner for Mango Royal integration testing",
+  "scripts": {
+    "start": "node --env-file=.env server.js",
+    "test": "node --test"
+  }
+}
