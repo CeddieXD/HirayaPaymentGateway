@@ -8,7 +8,13 @@ const path = require('node:path');
 const METHODS = new Set(['GCASH', 'MAYA', 'CARD']);
 const OUTCOMES = new Set(['CONFIRMED', 'PENDING', 'FAILED', 'UNAVAILABLE']);
 const MAX_BODY_BYTES = 16 * 1024;
+const MAX_REQUEST_LOGS = 1000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DASHBOARD_FILES = new Map([
+    ['/', ['index.html', 'text/html; charset=utf-8']],
+    ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
+    ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+]);
 
 function respond(res, status, body) {
     res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -85,15 +91,67 @@ function persistTransactions(storeFile, transactions) {
     fs.renameSync(temporaryFile, storeFile);
 }
 
-function createPaymentServer({ outcome = 'CONFIRMED', log = console.log, storeFile = null } = {}) {
+function loadRequestLogs(logFile) {
+    if (!logFile || !fs.existsSync(logFile)) return [];
+    const stored = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+    if (!Array.isArray(stored) || stored.some(entry =>
+        !entry || typeof entry.id !== 'string'
+        || typeof entry.timestamp !== 'string'
+        || !entry.request || typeof entry.request !== 'object'
+        || !entry.response || typeof entry.response !== 'object'
+    )) {
+        throw new Error('The payment request log has an invalid format.');
+    }
+    return stored.slice(-MAX_REQUEST_LOGS);
+}
+
+function persistRequestLogs(logFile, requests) {
+    if (!logFile) return;
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    const temporaryFile = `${logFile}.${process.pid}.tmp`;
+    fs.writeFileSync(temporaryFile, JSON.stringify(requests), { mode: 0o600 });
+    fs.renameSync(temporaryFile, logFile);
+}
+
+function paymentRequestDetails(payload) {
+    const value = (key, maxLength = 100) => (
+        typeof payload?.[key] === 'string' ? payload[key].slice(0, maxLength) : null
+    );
+    return {
+        order_id: value('order_id'),
+        external_order_id: value('external_order_id'),
+        amount: Number.isFinite(payload?.amount) ? payload.amount : null,
+        currency: value('currency', 3),
+        channel: value('channel', 20),
+        order_status: value('order_status', 20),
+        correlation_id: value('correlation_id', 36),
+    };
+}
+
+function createPaymentServer({
+    outcome = 'CONFIRMED',
+    log = console.log,
+    storeFile = null,
+    requestLogFile = null,
+} = {}) {
     const normalizedOutcome = String(outcome).toUpperCase();
     if (!OUTCOMES.has(normalizedOutcome)) {
         throw new Error(`Unsupported SIMULATED_PAYMENT_OUTCOME "${outcome}".`);
     }
     const transactions = loadTransactions(storeFile);
+    const requestLogs = loadRequestLogs(requestLogFile);
 
     return createServer(async (req, res) => {
         const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
+        const dashboardFile = DASHBOARD_FILES.get(pathname);
+        if (req.method === 'GET' && dashboardFile) {
+            const filePath = path.join(__dirname, 'public', dashboardFile[0]);
+            if (!fs.existsSync(filePath)) {
+                return respond(res, 500, { error: 'Payment dashboard file is missing.' });
+            }
+            res.writeHead(200, { 'Content-Type': dashboardFile[1] });
+            return fs.createReadStream(filePath).pipe(res);
+        }
         if (req.method === 'GET' && pathname === '/health') {
             const available = normalizedOutcome !== 'UNAVAILABLE';
             return respond(res, available ? 200 : 503, {
@@ -101,20 +159,55 @@ function createPaymentServer({ outcome = 'CONFIRMED', log = console.log, storeFi
                 environment: 'sandbox',
             });
         }
+        if (req.method === 'GET' && pathname === '/api/requests') {
+            return respond(res, 200, {
+                total: requestLogs.length,
+                requests: [...requestLogs].reverse(),
+            });
+        }
         if (req.method !== 'POST' || pathname !== '/api/payments/initiate') {
             return respond(res, 404, { error: 'Route not found.' });
         }
+
+        const startedAt = Date.now();
+        const requestLog = {
+            id: randomUUID(),
+            timestamp: new Date(startedAt).toISOString(),
+            method: req.method,
+            path: pathname,
+            request: paymentRequestDetails(null),
+            response: {},
+            duration_ms: 0,
+        };
+        const respondToPayment = (status, body) => {
+            requestLog.response = {
+                http_status: status,
+                status: body.status || null,
+                payment_ref_id: body.payment_ref_id || null,
+                message: body.message || body.error || null,
+            };
+            requestLog.duration_ms = Date.now() - startedAt;
+            requestLogs.push(requestLog);
+            if (requestLogs.length > MAX_REQUEST_LOGS) requestLogs.shift();
+            try {
+                persistRequestLogs(requestLogFile, requestLogs);
+            } catch (error) {
+                log(JSON.stringify({ event: 'payment.request_log_failed', message: error.message }));
+            }
+            return respond(res, status, body);
+        };
 
         let payload;
         try {
             payload = await readJson(req);
         } catch (error) {
-            return respond(res, error.statusCode || 400, { error: error.message });
+            return respondToPayment(error.statusCode || 400, { error: error.message });
         }
+        requestLog.request = paymentRequestDetails(payload);
 
         const correlationId = req.headers['x-correlation-id'];
         const validationError = validatePayment(payload, correlationId);
-        if (validationError) return respond(res, 400, { error: validationError });
+        if (validationError) return respondToPayment(400, { error: validationError });
 
         const fingerprint = JSON.stringify({
             external_order_id: payload.external_order_id,
@@ -126,16 +219,16 @@ function createPaymentServer({ outcome = 'CONFIRMED', log = console.log, storeFi
         const previous = transactions.get(correlationId);
         if (previous) {
             if (previous.fingerprint !== fingerprint) {
-                return respond(res, 409, {
+                return respondToPayment(409, {
                     status: 'FAILED',
                     message: 'This correlation_id was already used for a different payment request.',
                 });
             }
-            return respond(res, 200, previous.result);
+            return respondToPayment(200, previous.result);
         }
 
         if (normalizedOutcome === 'UNAVAILABLE') {
-            return respond(res, 503, {
+            return respondToPayment(503, {
                 status: 'UNAVAILABLE',
                 message: 'Hiraya Café Payment Gateway sandbox is unavailable.',
             });
@@ -155,7 +248,7 @@ function createPaymentServer({ outcome = 'CONFIRMED', log = console.log, storeFi
             persistTransactions(storeFile, nextTransactions);
         } catch (error) {
             log(JSON.stringify({ event: 'payment.store_failed', message: error.message }));
-            return respond(res, 503, {
+            return respondToPayment(503, {
                 status: 'UNAVAILABLE',
                 message: 'Sandbox could not save the payment idempotency record.',
             });
@@ -168,7 +261,7 @@ function createPaymentServer({ outcome = 'CONFIRMED', log = console.log, storeFi
             channel: payload.channel,
             status: result.status,
         }));
-        return respond(res, 200, result);
+        return respondToPayment(200, result);
     });
 }
 
@@ -178,7 +271,10 @@ if (require.main === module) {
     const storeFile = process.env.PAYMENT_STORE_FILE
         ? path.resolve(process.env.PAYMENT_STORE_FILE)
         : path.join(__dirname, 'data', 'transactions.json');
-    const server = createPaymentServer({ outcome, storeFile });
+    const requestLogFile = process.env.PAYMENT_REQUEST_LOG_FILE
+        ? path.resolve(process.env.PAYMENT_REQUEST_LOG_FILE)
+        : path.join(__dirname, 'data', 'requests.json');
+    const server = createPaymentServer({ outcome, storeFile, requestLogFile });
     server.listen(port, '127.0.0.1', () => {
         console.log(`Hiraya Café payment sandbox listening on http://127.0.0.1:${port} (${outcome})`);
     });

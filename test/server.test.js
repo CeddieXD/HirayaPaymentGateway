@@ -129,3 +129,46 @@ test('preserves the idempotent result when the sandbox restarts', async t => {
     assert.deepEqual(retry, first);
     assert.equal(secondResponse.status, 200);
 });
+
+test('serves troubleshooting scenarios and records successful, conflicting, and rejected requests', async t => {
+    const requestLogFile = path.join(os.tmpdir(), `hiraya-request-log-${process.pid}-${Date.now()}.json`);
+    const server = createPaymentServer({ log: () => {}, requestLogFile });
+    const baseUrl = await listen(server);
+    t.after(() => {
+        if (fs.existsSync(requestLogFile)) fs.unlinkSync(requestLogFile);
+        return new Promise(resolve => server.close(resolve));
+    });
+
+    const pageResponse = await fetch(baseUrl);
+    assert.equal(pageResponse.status, 200);
+    assert.match(pageResponse.headers.get('content-type'), /text\/html/);
+    const page = await pageResponse.text();
+    assert.match(page, /Payment activity/);
+    assert.match(page, /Exercise a failure scenario/);
+
+    const successResponse = await postPayment(baseUrl);
+    assert.equal(successResponse.status, 200);
+    const changedRequest = { ...paymentRequest, amount: 126 };
+    const conflictResponse = await postPayment(baseUrl, changedRequest);
+    assert.equal(conflictResponse.status, 409);
+    const invalidRequest = { ...paymentRequest, amount: -1 };
+    const rejectedResponse = await postPayment(baseUrl, invalidRequest);
+    assert.equal(rejectedResponse.status, 400);
+
+    const historyResponse = await fetch(`${baseUrl}/api/requests`);
+    const history = await historyResponse.json();
+    assert.equal(history.total, 3);
+    assert.equal(history.requests[0].response.http_status, 400);
+    assert.equal(history.requests[0].response.status, null);
+    assert.equal(history.requests[0].request.amount, -1);
+    assert.equal(history.requests[0].method, 'POST');
+    assert.equal(history.requests[0].path, '/api/payments/initiate');
+    assert.equal(history.requests[1].response.http_status, 409);
+    assert.match(history.requests[1].response.message, /already used/);
+    assert.equal(history.requests[2].response.status, 'CONFIRMED');
+    assert.equal(history.requests[2].request.external_order_id, 'MROYAL-1042');
+    assert.equal(typeof history.requests[2].duration_ms, 'number');
+
+    const persistedHistory = JSON.parse(fs.readFileSync(requestLogFile, 'utf8'));
+    assert.equal(persistedHistory.length, 3);
+});
